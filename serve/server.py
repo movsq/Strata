@@ -2747,6 +2747,9 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         bias_api.validate_request(sampling or {}, self, None)
         refuse_for_split(self, sampling or {})
+        # the tokens the engine generated after the consumer stopped reading (read while draining to DONE below): the
+        # engine stops between verify windows, so its state can hold a few tokens past the consumer's cut
+        self.overrun = []
         if getattr(self, "batch", 0) and not self.multi:
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)
             return
@@ -2905,6 +2908,8 @@ class StrataEngine:
                     if line.startswith("DONE"):
                         self._parse_done(line)
                         break
+                    if line.startswith("T ") and line[2:].strip().isdigit():
+                        self.overrun.append(int(line[2:]))
                     if not self.can_stop:
                         heard = time.monotonic()
             if rid is not None:                           # this request's lines are over (a late one goes nowhere)
@@ -6164,6 +6169,13 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        # dotware: llama.cpp's soft stage (reasoning_budget_soft_tokens + _soft_message, written into the reasoning once,
+        # which goes on) and its reasoning_budget_message (written before </think> in place of the wrap-up sentence)
+        soft = (sampling or {}).get("reasoning_budget_soft_tokens") if budget else None
+        soft_text = (sampling or {}).get("reasoning_budget_soft_message")
+        if not (isinstance(soft, int) and not isinstance(soft, bool) and 0 < soft < budget and soft_text):
+            soft = None
+        close_text = (sampling or {}).get("reasoning_budget_message")
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
             # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
             # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
@@ -6342,6 +6354,7 @@ class Service:
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        nudge = False                   # dotware: the soft budget is reached
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -6419,6 +6432,9 @@ class Service:
                                     # at a clean point: no tag held back, no character split across tokens
                                     if thought >= budget and parser.clean and not detok.pending():
                                         wrap = True
+                                        break
+                                    if soft and thought >= soft and parser.clean and not detok.pending():
+                                        nudge = True
                                         break
                                 if force:
                                     if any(ev.kind in ("tool_start", "tool_call") for ev in evs):
@@ -6520,7 +6536,7 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
-                        if not (wrap or opens) or cancel.is_set():
+                        if not (wrap or opens or nudge) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
                         # short wrap-up and </think>) and let it answer: the next pass's prompt is this one plus what
@@ -6529,17 +6545,35 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = REASONING_WRAP_UP + (force or "")
+                            text = (close_text + REASONING_CLOSE if close_text else REASONING_WRAP_UP) + (force or "")
+                            force = None
+                        elif nudge:
+                            soft, text = None, soft_text
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
-                        force = None
+                            force = None
                         extra = self.tok.encode(text, parse_special=True)
-                        if max_new - n - len(extra) < 1:
+                        # The engine stops between its verify windows, so it may already hold a few thinking tokens
+                        # past the budget that this pass did not read.  The next prompt carries them too, so it extends
+                        # the engine's state instead of diverging from it (which re-read the whole thinking from the
+                        # prompt's checkpoint).  Not when they could end the thinking or hold part of a tag or character,
+                        # nor when they would take the room an answer still has.
+                        over = list(getattr(self.engine, "overrun", None) or []) if wrap or nudge else []
+                        if over and (any(t in self.stop_ids for t in over) or
+                                     any(c in self.tok.decode(over) for c in "<\ufffd") or
+                                     max_new - n - len(over) - len(extra) < 1):
+                            over = []
+                        if max_new - n - len(over) - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
+                        flight = f", {len(over)} more in flight" if over else ""
                         if wrap:
-                            print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                            print(f"[strata] thinking budget reached ({thought} tokens{flight}): wrapping up the thinking",
                                   flush=True)
-                        for t in extra:
+                        if nudge:
+                            print(f"[strata] soft thinking budget reached ({thought} tokens{flight}): reminder written",
+                                  flush=True)
+                        seg = seg + over
+                        for t in over + extra:
                             n += 1
                             raw_ids.append(t)
                             thinking_n += parser.state in ("reasoning", "rcall")
