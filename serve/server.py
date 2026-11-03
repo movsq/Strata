@@ -6041,8 +6041,9 @@ class Service:
             raise ValueError('strata_prefix: {"messages": K} (the first K messages), {"message": I, "chars": N} (the first '
                              'N characters of message I) or {"tokens": N}')
         for k, v in spec.items():
-            if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "message" else 1):
-                raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
+            # chars=0 ends the prefix after message I's header: a pin past the live end when the history before I is all of it
+            if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k in ("message", "chars") else 1):
+                raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k in ('message', 'chars') else '1'} or more)")
         if has_images:
             print("[strata] strata_prefix ignored: the request has images", flush=True)
             return {}

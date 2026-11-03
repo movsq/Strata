@@ -1767,6 +1767,10 @@ class SharedPrefix(unittest.TestCase):
         req = {"strata_prefix": {"message": 1, "chars": 160}}
         ids, _, _ = self.svc.prepare(msgs, None, {}, 16, req=req)
         self.assertEqual(self.tok.decode(ids[:req["strata_prefix"]["tokens"]]).split("user\n", 1)[1], "DOC " * 40)
+        # chars=0: the prefix ends right after message 1's header
+        req = {"strata_prefix": {"message": 1, "chars": 0}}
+        ids, _, _ = self.svc.prepare(msgs, None, {}, 16, req=req)
+        self.assertTrue(self.tok.decode(ids[:req["strata_prefix"]["tokens"]]).endswith("user\n"))
 
     def test_without_the_field_nothing_changes(self):
         req = {"temperature": 0}
