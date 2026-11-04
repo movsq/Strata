@@ -6260,6 +6260,7 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         request_id = uuid.uuid4().hex[:12]
         setattr(cancel, "_strata_request_id", request_id)
+        setattr(cancel, "_strata_live", (st, rate))     # what live_timings reads while this request generates
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
@@ -7132,7 +7133,38 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
+def live_timings(svc: Service, ids, cancel) -> dict | None:
+    """llama.cpp's `timings_per_token`: the counts so far on every chunk while the reply is written, in the names of
+    the final `timings` (which replace them in the last chunk).  None before the first token."""
+    live = getattr(cancel, "_strata_live", None)
+    if live is None:
+        return None
+    with svc.status_lock:
+        st, rate = dict(live[0]), list(live[1])
+    if not st.get("first_token"):
+        return None
+    cache_n = min(int(getattr(svc.engine, "reused", 0) or 0), len(ids))
+    return {"cache_n": cache_n, "prompt_n": len(ids) - cache_n, "predicted_n": int(st.get("generated") or 0),
+            "predicted_per_second": round(Service._rate_of(st, rate), 1)}
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
+    chunks = _openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run, force)
+    if not req.get("timings_per_token"):
+        yield from chunks
+        return
+    try:
+        for c in chunks:
+            if c is not None and "timings" not in c and "prompt_progress" not in c and c["choices"][0]["delta"]:
+                t = live_timings(svc, ids, cancel)
+                if t is not None:
+                    c["timings"] = t
+            yield c
+    finally:
+        chunks.close()                  # a client that left must reach the request as a disconnect at once
+
+
+def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
     """`run`: the events to send instead of Service.run's (run_with_mcp); its ("mcp", {...}) items become chunks with
     an empty delta and a `strata_mcp` field, which only the web app reads.  `force`: see Service.run."""
     cid, created = "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())

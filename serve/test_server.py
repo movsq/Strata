@@ -3254,6 +3254,26 @@ class PromptProgress(unittest.TestCase):
         self.assertEqual(prompt_progress(self.svc)["cache"], 0,
                          "an engine too old to print RESUME counts the reused prefix as work")
 
+    def chunks(self, **req):
+        return [json.loads(line[6:]) for line in self.stream(**req).splitlines()
+                if line.startswith("data: ") and line != "data: [DONE]"]
+
+    def test_timings_per_token_counts_the_reply_as_it_is_written(self):
+        # llama.cpp's `timings_per_token`: a client shows the context and speed while the reply streams, not only at its end
+        written = [c for c in self.chunks(timings_per_token=True)
+                   if c["choices"][0]["finish_reason"] is None and {"content", "reasoning_content"} & c["choices"][0]["delta"].keys()
+                   and "timings" in c]
+        counts = [c["timings"]["predicted_n"] for c in written]
+        self.assertEqual(counts, sorted(counts), "the count only grows")
+        self.assertEqual(counts[-1], self.TOKENS)
+        first = written[0]["timings"]
+        self.assertEqual(first["cache_n"] + first["prompt_n"], self.chunks()[-1]["usage"]["prompt_tokens"],
+                         "cache_n + prompt_n is the whole prompt, as in the final timings")
+        self.assertIn("predicted_per_second", first)
+
+    def test_no_timings_per_token_unless_asked(self):
+        self.assertFalse([c for c in self.chunks() if "timings" in c and c["choices"][0]["finish_reason"] is None])
+
 
 class ConfigReasoningEffort(unittest.TestCase):
     """#1641: the config's "reasoning_effort" is the thinking level of requests that name none; "--reasoning-effort" in
