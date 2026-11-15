@@ -3242,7 +3242,8 @@ class Vision:
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
-        self.dir = self.work_dir()
+        self.persistent_cache = self.cache_directory(cfg)
+        self.dir = self.persistent_cache or self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         # AMD: the GPU reader (strata-vision-hip) has the CPU reader (strata-vision, same program, no GPU runtime) to
         # fall back on when it does not start; _start switches to it by itself
@@ -3254,6 +3255,10 @@ class Vision:
         self.stopped = True
         self.lock = threading.Lock()
         self.cache: dict[str, tuple[Path, int]] = {}
+        if self.persistent_cache is not None:
+            self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.cache = self.read_cache(self.dir)
+            print(f"[strata] images: reused {len(self.cache)} encodings from disk", flush=True)
         # opt-in (the vision section's "elastic": true, with the config's "vram_elastic"): the encoder starts with the
         # first picture and stops after elastic_idle_s without one; while it runs, the engine's expert cache keeps
         # elastic_mib of VRAM free for it (Service._vision_up / _vision_idle_down)
@@ -3278,6 +3283,38 @@ class Vision:
             except (TypeError, ValueError):
                 pass
         return Vision.DEFAULT_MAX_TOKENS["gpu" if cfg.get("gpu") else "cpu"]
+
+    @staticmethod
+    def cache_directory(cfg: dict) -> Path | None:
+        if not cfg.get("cache_dir"):
+            return None
+        args = Vision.reader_args(cfg)
+        files = []
+        for name in (cfg["exe"], cfg["mmproj"], cfg["model"]):
+            path = Path(shutil.which(str(name)) or name).resolve()
+            stat = path.stat()
+            files.append((str(path), stat.st_size, stat.st_mtime_ns))
+        # Embeddings belong to this encoder, model, projector and reader settings.
+        identity = hashlib.sha256(json.dumps([args, files]).encode()).hexdigest()[:32]
+        directory = Path(cfg["cache_dir"]).expanduser().resolve() / identity
+        if " " in str(directory):
+            raise ValueError("vision.cache_dir must not contain spaces")
+        return directory
+
+    @staticmethod
+    def read_cache(directory: Path) -> dict[str, tuple[Path, int]]:
+        cached = {}
+        for path in directory.glob("*.sve"):
+            if not re.fullmatch(r"[0-9a-f]{32}", path.stem) or path.is_symlink():
+                continue
+            try:
+                with path.open("rb") as file:
+                    magic, tokens, width, height, dim = struct.unpack("<4s4I", file.read(20))
+                if magic == b"SVE1" and min(tokens, width, height, dim) > 0 and path.stat().st_size == 20 + tokens * dim * 4:
+                    cached[path.stem] = (path, tokens)
+            except (OSError, struct.error):
+                pass  # A partial file left by a crash is encoded again.
+        return cached
 
     @staticmethod
     def reader_args(cfg: dict) -> list:
@@ -3570,7 +3607,8 @@ class Vision:
         """#914: close() for good: the server ends, so the encoder's directory (one ~10 MB .sve per image, on a tmpfs
         /tmp that is RAM) goes with it instead of piling up with every start.  unload() keeps it for the restart."""
         self.close()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        if getattr(self, "persistent_cache", None) is None:
+            shutil.rmtree(self.dir, ignore_errors=True)
 
 
 def gpu_list(cfg: dict) -> list[int]:

@@ -808,6 +808,12 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
 
+The vision config may set `"cache_dir": "/path/without/spaces"` to keep image encodings across server restarts.
+The directory is partitioned by encoder arguments and the encoder, model and projector file identities (path, size and
+modification time). Startup accepts only complete SVE files with valid headers and lengths. The existing 64-image eviction
+policy still applies. Without this setting, the temporary cache and shutdown cleanup are unchanged. A new or evicted image
+still needs encoding; restoring a model session does not replace its image encodings.
+
 ### The web page (Chat, Images, Monitor, About)
 
 Open the server's address in a browser. Everything in it runs from the server's own files: no CDN, no outside address. Chats,
