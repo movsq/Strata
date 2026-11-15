@@ -219,9 +219,13 @@ struct SessionReadLimits {
     // A layer past the end of the list is bounded by the payload only.
     std::vector<std::array<uint64_t, 5>> max_kv_bytes;
     // the RAM PREFLIGHT: asked once the header and identity match and before any payload allocation, with what the
-    // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
+    // parse holds at its peak (session_read_peak_bytes); false refuses the file. With stream_kv, also checked
+    // before each metadata allocation against current available RAM plus bounded transfer scratch. Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // Keep K/V on the opened file and recheck each chunk before transfer. Metadata stays owned in RAM.
+    // Admission is incremental before each metadata allocation, reserving bounded transfer buffers.
+    bool stream_kv = false;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);

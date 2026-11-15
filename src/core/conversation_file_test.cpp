@@ -769,6 +769,101 @@ int main() {
     }
 #endif
 
+
+    // Streaming restore keeps validated K/V on the original descriptor and reads bounded chunks.
+    {
+        SessionReadLimits limits;
+        limits.stream_kv = true;
+        uint64_t largest = 0;
+        limits.admit = [&](uint64_t n, std::string&) { largest = std::max(largest, n); return true; };
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(good.string(), id, back, read, error, limits), "streaming read validates");
+        check(read == image.size() && same(original, back), "streaming read matches every payload byte");
+        check(back.kv[0].k.file_backed() && back.kv[0].k.bytes() < 1024,
+              "streamed K/V has no payload allocation");
+        check(largest <= 49u << 20, "streaming admission reserves bounded scratch, not the file");
+        std::array<uint8_t, 19> got{}, want{};
+        const size_t cross = ConversationBuffer::segment_bytes - 7;
+        check(back.kv[0].k.read(got.data(), cross, got.size()) &&
+              original.kv[0].k.read(want.data(), cross, want.size()) && got == want,
+              "a partial read crosses a verified chunk boundary");
+        check(!back.kv[0].k.read(got.data(), back.kv[0].k.size() - 1, got.size()), "streamed read checks its bounds");
+        auto copy = back.kv[0].k;
+        check(copy.allocation_peak(copy.size()) >= copy.size(), "a streamed write accounts for materialization");
+        check(copy.visit(0, 1, [](uint8_t* p, size_t, size_t) { *p ^= 1; return true; }) &&
+              !copy.file_backed() && !(copy == back.kv[0].k), "a mutable visit detaches the streamed copy");
+        check(back.kv[0].k == original.kv[0].k, "writing a copy leaves the streamed original alone");
+        auto moved = std::move(copy);
+        check(copy.empty() && moved.size() == original.kv[0].k.size(), "streamed/owned move leaves an empty source");
+        auto empty = back.kv[0].k;
+        empty.resize(0);
+        check(empty.empty() && !empty.file_backed(), "clearing streamed storage does not read the file");
+
+        SessionReadLimits denied = limits;
+        denied.admit = [](uint64_t, std::string& why) { why = "streaming no room"; return false; };
+        check(rejects(good, id, "streaming no room", denied), "streaming still honors RAM refusal");
+        denied.admit = [](uint64_t n, std::string& why) { why = "metadata no room"; return n >= 49u << 20; };
+        check(rejects(good, id, "metadata no room", denied), "metadata allocation has its own admission");
+        const fs::path bad = dir / "stream-corrupt.bin";
+        auto damaged = image; damaged[damaged.size() / 2] ^= 1; spit(bad, damaged);
+        check(rejects(bad, id, "checksum", limits), "streaming verifies the entire payload before returning");
+
+        // A published replacement cannot redirect a descriptor-backed image.
+        const fs::path replaced = dir / "stream-replaced.bin";
+        spit(replaced, image);
+        SavedConversation held;
+        check(session_file_read(replaced.string(), id, held, read, error, limits), "open streamed replacement fixture");
+        fs::rename(replaced, dir / "stream-old.bin");
+        spit(replaced, std::vector<char>(image.size(), 'x'));
+        check(same(original, held), "streamed buffers keep the original file handle after path replacement");
+
+        // In-place edits or truncation after full validation cannot feed unchecked bytes to a transfer.
+        const fs::path changed = dir / "stream-changed.bin";
+        spit(changed, image);
+        check(session_file_read(changed.string(), id, held, read, error, limits), "open streamed mutation fixture");
+        spit(changed, damaged);
+        bool touched = false;
+        check(!std::as_const(held.kv[0].k).visit(0, held.kv[0].k.size(),
+              [&](const uint8_t*, size_t, size_t) { touched = true; return true; }) && !touched,
+              "a changed first chunk is refused before exposing any bytes");
+        spit(changed, image);
+        fs::resize_file(changed, 64);
+        check(!held.kv[0].k.read(got.data(), 0, got.size()), "a file truncated after validation fails its read");
+    }
+#if defined(__linux__) && !defined(__SANITIZE_ADDRESS__) && !defined(STRATA_NO_RLIMIT_TEST)
+    // A 256 MiB K/V image restores under a 192 MiB address-space ceiling.
+    {
+        const fs::path large = dir / "stream-large.bin";
+        {
+            SavedConversation big = original;
+            big.kv[0].k = pattern(256u << 20, 9);
+            check(session_file_write(large.string(), big, id, written, error), "write large streaming fixture");
+        }
+        const pid_t child = ::fork();
+        check(child >= 0, "fork streaming memory probe");
+        if (child == 0) {
+            const rlimit cap{192u << 20, 192u << 20};
+            if (::setrlimit(RLIMIT_AS, &cap) != 0) _exit(2);
+            SavedConversation back;
+            size_t read = 0;
+            SessionStatus status;
+            if (session_file_read(large.string(), id, back, read, error, {}, &status) ||
+                status.error != SessionError::memory) _exit(3);
+            SessionReadLimits limits; limits.stream_kv = true;
+            if (!session_file_read(large.string(), id, back, read, error, limits)) _exit(4);
+            uint8_t first = 0, last = 0;
+            const auto& k = back.kv[0].k;
+            if (!k.file_backed() || !k.read(&first, 0, 1) || !k.read(&last, k.size() - 1, 1) ||
+                first != 9 || last != uint8_t((k.size() - 1) * 131u + 9)) _exit(5);
+            _exit(0);
+        }
+        int result = 0;
+        check(::waitpid(child, &result, 0) == child && WIFEXITED(result) && WEXITSTATUS(result) == 0,
+              "large K/V restores below its payload size without lowering the RAM floor");
+    }
+#endif
+
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);
     return 0;

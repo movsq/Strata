@@ -7,17 +7,28 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <functional>
+#include <stdexcept>
 #include <memory>
 #include <utility>
 #include <vector>
 
 namespace strata::core {
 
-// Snapshot-owned host storage. Appending never relocates existing payloads;
-// only the small segment directory can move. No sharing or copy-on-write is
-// needed because a parked image and its retained active buffers have one owner.
+// Snapshot-owned host storage. Appending never relocates existing payloads; only the small segment directory
+// can move. A disk restore may instead hold a verified read-only source; writes materialize an owned copy.
 class ConversationBuffer {
 public:
+    using Visitor = std::function<bool(const uint8_t*, size_t, size_t)>;
+    using Reader = std::function<bool(size_t, size_t, const Visitor&)>;
+    // Immutable, verified chunks from an owned file handle. A write first makes an owned copy.
+    static ConversationBuffer from_reader(size_t n, Reader reader) {
+        ConversationBuffer out;
+        out.size_ = n;
+        if (n) out.reader_ = std::move(reader);
+        return out;
+    }
+    bool file_backed() const { return bool(reader_); }
     static constexpr size_t segment_bytes = 16 * 1024 * 1024;
     ConversationBuffer() = default;
     ConversationBuffer(std::initializer_list<uint8_t> values) {
@@ -30,10 +41,11 @@ public:
     ConversationBuffer(const ConversationBuffer&) = default;
     ConversationBuffer& operator=(const ConversationBuffer&) = default;
     ConversationBuffer(ConversationBuffer&& other) noexcept
-        : segments_(std::move(other.segments_)), size_(std::exchange(other.size_, 0)) {}
+        : segments_(std::move(other.segments_)), size_(std::exchange(other.size_, 0)), reader_(std::move(other.reader_)) {}
     ConversationBuffer& operator=(ConversationBuffer&& other) noexcept {
         if (this == &other) return *this;
         segments_ = std::move(other.segments_);
+        reader_ = std::move(other.reader_);
         size_ = std::exchange(other.size_, 0);
         return *this;
     }
@@ -48,6 +60,7 @@ public:
     // Includes the old directory while reserve allocates its replacement.
     // Saturation makes an overflowing estimate fail admission before resize.
     size_t allocation_peak(size_t n) const {
+        if (reader_) return ConversationBuffer{}.allocation_peak(std::max(n, size_));
         size_t total = bytes();
         if (n <= size_) return total;
         const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
@@ -64,6 +77,8 @@ public:
     }
     void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
     void resize_impl(size_t n, const uint8_t* value) {
+        if (reader_ && n == 0) { reader_ = {}; size_ = 0; return; }
+        materialize();
         if (n > size_) {
             const size_t held = size_;
             const bool growing = held != 0;
@@ -103,9 +118,13 @@ public:
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
+        materialize();
         return visit_impl(*this, offset, count, fn);
     }
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) const {
+        if (offset > size_ || count > size_ - offset) return false;
+        if (!count) return true;
+        if (reader_) return reader_(offset, count, fn);
         return visit_impl(*this, offset, count, fn);
     }
     bool read(void* target, size_t offset, size_t count) const {
@@ -116,6 +135,12 @@ public:
     }
     bool operator==(const ConversationBuffer& other) const {
         if (size_ != other.size_) return false;
+        if (reader_ || other.reader_) {
+            std::vector<uint8_t> scratch(std::min(size_, segment_bytes));
+            return visit(0, size_, [&](const uint8_t* p, size_t n, size_t at) {
+                return other.read(scratch.data(), at, n) && std::memcmp(p, scratch.data(), n) == 0;
+            });
+        }
         size_t a = 0, b = 0, x = 0, y = 0;
         while (a < segments_.size() && b < other.segments_.size()) {
             const auto& left = segments_[a];
@@ -130,6 +155,19 @@ public:
     }
 
 private:
+    void materialize() {
+        if (!reader_) return;
+        ConversationBuffer owned;
+        owned.resize_for_overwrite(size_);
+        const bool ok = std::as_const(*this).visit(0, size_, [&](const uint8_t* p, size_t n, size_t at) {
+            return owned.visit(at, n, [&](uint8_t* to, size_t count, size_t offset) {
+                std::memcpy(to, p + offset - at, count);
+                return true;
+            });
+        });
+        if (!ok) throw std::runtime_error("file-backed conversation data is unavailable or changed");
+        *this = std::move(owned);
+    }
     // value-initializes only when asked (resize's explicit fill value): resize_for_overwrite leaves the bytes alone
     template<class T> struct DefaultInit : std::allocator<T> {
         template<class U> struct rebind { using other = DefaultInit<U>; };
@@ -173,6 +211,7 @@ private:
     }
     std::vector<Segment> segments_;
     size_t size_ = 0;
+    Reader reader_;
 };
 
 } // namespace strata::core

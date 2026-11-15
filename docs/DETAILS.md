@@ -792,6 +792,12 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
 - `--session-save-reclaim` (engine argument, off by default) lets a save that fails its RAM check first release reconstructible
   host caches (retained K/V, oldest unpinned parked conversations, unpinned checkpoints), and the server waits up to 30 s for
   RAM accounting to catch up. It trades later prefix-cache hits for room to save and cannot guarantee a save.
+- `--session-restore-stream` (engine argument, off by default) validates the entire file, then restores K/V through
+  16 MiB host chunks instead of retaining another full K/V image in RAM. Metadata remains owned in RAM; admission is
+  checked before each metadata allocation with the same RAM floor and room for transfer scratch. K/V keeps the opened
+  file handle, and every chunk is re-read and checked against its validated checksum before its bytes reach the device.
+  A file changed after validation fails the transfer; the engine exits if device writes have begun. The file format and
+  the default restore path are unchanged.
 - Clients still send their messages and images; the file holds engine state and token identity, not a chat export. A follow-up
   that continues the restored conversation reuses its state; a short tail may be read again. Only the deepest checkpoint is saved.
 - A file is bound to the model files (sampled by size and first and last MiB, not by path) and to the settings that change what

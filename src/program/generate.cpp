@@ -943,6 +943,7 @@ struct Options {
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     bool session_save_reclaim = false;
+    bool session_restore_stream = false;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -1121,6 +1122,7 @@ void usage() {
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                 "  --session-restore-stream  --serve: restore verified K/V in bounded host chunks (opt-in)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
@@ -3611,6 +3613,7 @@ int main(int argc, char** argv) {
         else if (a == "--serve") o.serve = true;
         else if (a == "--vision") o.vision = true;
         else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
+        else if (a == "--session-restore-stream") o.session_restore_stream = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
@@ -15716,6 +15719,7 @@ int main(int argc, char** argv) {
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
                         // file size follows from them.  The RAM the parse needs at its peak is asked first.
                         strata::core::SessionReadLimits limits;
+                        limits.stream_kv = o.session_restore_stream;
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
@@ -15760,6 +15764,7 @@ int main(int argc, char** argv) {
                     blocking("transfer", bytes);
                     if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
                         strata::core::ConversationRestore::restored) {
+                        if (err.empty()) err = "a saved K/V chunk is unavailable or changed after validation";
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
                         std::fprintf(stderr, "strata serve: session restore %s: transfer failed: %s\n", path.c_str(),

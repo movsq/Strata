@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <system_error>
@@ -410,6 +411,7 @@ public:
         while (n) {
             const ssize_t r = ::pread(fd_, p, n, (off_t) offset);
             if (r < 0 && errno == EINTR) continue;
+            if (r < 0 && errno == EINVAL && direct_ && leave_direct()) continue;
             if (r <= 0) { kind_ = r < 0 ? errno_kind(errno) : SessionError::io; error_ = r < 0 ? std::strerror(errno) : "file ends early"; return false; }
             p += r; n -= (size_t) r; offset += (uint64_t) r;
         }
@@ -602,6 +604,16 @@ public:
         }
         return true;
     }
+    uint64_t position() const { return total_ - have_ + at_; }
+    template<class Fn> bool consume(size_t n, Fn fn) {
+        while (n) {
+            if (at_ == have_ && !fill()) return false;
+            const size_t count = std::min(n, have_ - at_);
+            fn(buf_.get() + at_, count);
+            at_ += count; n -= count;
+        }
+        return true;
+    }
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
@@ -716,6 +728,17 @@ struct In {
     const SessionReadLimits& limits;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
+    std::shared_ptr<RawFile> backing;
+    std::shared_ptr<std::mutex> read_lock;
+    bool allocate(uint64_t bytes) {
+        if (!limits.stream_kv || !limits.admit) return true;
+        // Already allocated metadata is reflected in live RAM telemetry. Leave room for read/transfer scratch.
+        const uint64_t scratch = 2 * kBlock + (1u << 20);
+        std::string why;
+        if (bytes <= UINT64_MAX - scratch && limits.admit(bytes + scratch, why)) return true;
+        kind = SessionError::memory;
+        return fail(why.empty() ? "metadata allocation is too large" : why);
+    }
     bool fail(const std::string& m) { if (error.empty()) error = "session file: " + m; return false; }
     bool raw(void* p, size_t c) {
         if (c > left) return fail("payload ends early");
@@ -738,6 +761,7 @@ struct In {
     template<class T> bool vec(std::vector<T>& v, uint64_t limit = UINT64_MAX) {
         uint64_t n = 0;
         if (!count(n, sizeof(T), limit)) return false;
+        if (!allocate(n * sizeof(T))) return false;
         v.resize((size_t) n);
         return raw(v.data(), (size_t) n * sizeof(T));
     }
@@ -746,6 +770,41 @@ struct In {
         const uint64_t limit = kv_layer < limits.max_kv_bytes.size() ? limits.max_kv_bytes[kv_layer][part] : UINT64_MAX;
         if (!count(n, 1, limit)) return false;
         b = {};
+        if (limits.stream_kv) {
+            const uint64_t start = f->position();
+            std::vector<uint64_t> hashes;
+            for (uint64_t at = 0; at < n;) {
+                const size_t count = (size_t) std::min<uint64_t>(kBlock, n - at);
+                SessionHasher chunk(0);
+                if (!f->consume(count, [&](const uint8_t* p, size_t c) {
+                        hash.update(p, c); chunk.update(p, c); left -= c;
+                    })) { kind = f->kind(); return fail("read error: " + f->error()); }
+                hashes.push_back(chunk.digest());
+                at += count;
+            }
+            b = ConversationBuffer::from_reader((size_t) n,
+                [file = backing, lock = read_lock, start, n, hashes = std::move(hashes)]
+                (size_t offset, size_t count, const ConversationBuffer::Visitor& visit) {
+                    if (offset > n || count > n - offset) return false;
+                    auto scratch = aligned_block();
+                    if (!scratch) return false;
+                    while (count) {
+                        const size_t block = offset / kBlock, begin = block * kBlock;
+                        const size_t bytes = (size_t) std::min<uint64_t>(kBlock, n - begin);
+                        {
+                            std::lock_guard<std::mutex> guard(*lock);
+                            if (!file->read_at(start + begin, scratch.get(), bytes)) return false;
+                        }
+                        // A file changed after validation must never supply unchecked bytes to the device.
+                        if (session_hash64(scratch.get(), bytes, 0) != hashes[block]) return false;
+                        const size_t part = std::min(count, bytes - (offset - begin));
+                        if (!visit(scratch.get() + offset - begin, part, offset)) return false;
+                        offset += part; count -= part;
+                    }
+                    return true;
+                });
+            return true;
+        }
         b.resize((size_t) n);
         return b.visit(0, b.size(), [&](uint8_t* p, size_t c, size_t) { return raw(p, c); });
     }
@@ -755,6 +814,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
     if (!in.vec(c.ids, in.limits.max_tokens)) return false;
     uint64_t n = 0;
     if (!in.count(n, 16, in.limits.max_tokens)) return false;
+    if (!in.allocate(n * sizeof(ConversationImageKey))) return false;
     c.imgs.resize((size_t) n);
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
@@ -778,9 +838,11 @@ bool get_payload(In& in, SavedConversation& s) {
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
+    if (!in.allocate(n * sizeof(ConversationCheckpoint))) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
+    if (!in.allocate(n * sizeof(ConversationKv))) return false;
     s.kv.resize((size_t) n);
     for (auto& k : s.kv) {
         in.kv_layer = (size_t) (&k - s.kv.data());
@@ -1176,11 +1238,11 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     error.clear();
     st = {};
     st.error = SessionError::invalid;   // every refusal below, unless the step says otherwise
-    RawFile raw;
+    auto raw = std::make_shared<RawFile>();
     uint64_t size = 0;
-    if (!raw.open_session(path, size)) {
-        st.error = raw.refused() ? SessionError::invalid : raw.kind();
-        error = "session file: " + path + ": " + raw.error();
+    if (!raw->open_session(path, size)) {
+        st.error = raw->refused() ? SessionError::invalid : raw->kind();
+        error = "session file: " + path + ": " + raw->error();
         return false;
     }
     if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
@@ -1190,7 +1252,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
                 (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
         return false;
     }
-    FileSource f(raw);
+    FileSource f(*raw);
     if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
     // installed before the first block (the header's) is read: every block reports, the first one included
     if (limits.progress) f.progress.emplace(limits.progress);
@@ -1215,7 +1277,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_peak_bytes(size), why)) {
+        if (!limits.admit(limits.stream_kv ? 3 * kBlock + (1u << 20) : session_read_peak_bytes(size), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1223,6 +1285,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
+    if (limits.stream_kv) { in.backing = raw; in.read_lock = std::make_shared<std::mutex>(); }
     if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
