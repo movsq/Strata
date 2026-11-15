@@ -728,8 +728,8 @@ struct In {
     const SessionReadLimits& limits;
     SessionError kind = SessionError::invalid;
     size_t kv_layer = 0;
-    std::shared_ptr<RawFile> backing;
-    std::shared_ptr<std::mutex> read_lock;
+    std::shared_ptr<RawFile> backing{};
+    std::shared_ptr<std::mutex> read_lock{};
     bool allocate(uint64_t bytes) {
         if (!limits.stream_kv || !limits.admit) return true;
         // Already allocated metadata is reflected in live RAM telemetry. Leave room for read/transfer scratch.
