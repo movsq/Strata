@@ -93,3 +93,16 @@ Not run / remaining gaps:
 ## Fixing workspace
 
 An isolated local checkout for this PR is available at `/tmp/strata-refinery-stream-restore/repo`. It starts at the exact reviewed Strata head and excludes the owner's unrelated working changes. Other work may be active in the original checkout; do not revert it. Keep code and tests scoped to F1/F2 and commit each meaningful step without attribution lines. The CPU check command above builds from this checkout as well; keep experimental probes outside the repository. Leave this PR as a draft while required platform/backend checks remain unperformed.
+
+## Fix validation (2026-11-16)
+
+F1 is fixed: the serialization sizing pass counts buffer lengths without reading their backing storage. The writing pass propagates a failed buffer visit as an I/O failure and never publishes its temporary file. Sink write failures retain their existing error classification. Regression coverage checks readers that fail before any bytes and after a partial visitor, the number of reader calls, destination preservation and temporary-file cleanup. A real truncated streamed image is also refused, while an intact streamed image rewrites byte-identically.
+
+F2's platform mismatch is confirmed from the Windows open/share flags and the unconditional mutation operations. The tests now keep the POSIX descriptor replacement/mutation checks on POSIX. On Windows they instead assert that rename, write-open and truncation are refused while the streamed handle is held, then verify that its data is unchanged. Production file-sharing permissions are unchanged. Windows test compilation and execution remain pending.
+
+Passed after these fixes:
+
+- Strict CPU-only build with the command above and execution: **234 checks passed** on Linux.
+- `git diff --check`.
+
+The backend, Windows and live-GPU checks listed above remain unperformed. Keep this PR as a draft.

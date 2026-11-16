@@ -658,7 +658,12 @@ struct Out {
     template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
     void buffer(const ConversationBuffer& b) {
         u64(b.size());
-        b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; });
+        if (!f) { count(b.size()); return; }
+        if (!ok) return;
+        if (!b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; })) {
+            read_failed = ok;
+            ok = false;
+        }
     }
     // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read)
     void source(const SessionKvSource& s, size_t part) {
