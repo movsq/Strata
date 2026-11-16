@@ -2,6 +2,8 @@
 
 Reviewed on 2026-11-16. Fixes in this PR target only the two findings below.
 
+Readiness targets the owner's single-user Linux/CUDA installation (RTX 3060, sm_86). Windows and other backends remain unverified and are outside this deployment target.
+
 ## Scope and interpretation
 
 - Strata: `ef53559cec74cc4bddc78033f9fcc2ec94d2106e..7eb19f0829b62e36d7ef1ad67c69a30780b064bb` (`bba66bf5`, `7eb19f08`). All six changed files were reviewed.
@@ -92,7 +94,7 @@ Not run / remaining gaps:
 
 ## Fixing workspace
 
-An isolated local checkout for this PR is available at `/tmp/strata-refinery-stream-restore/repo`. It starts at the exact reviewed Strata head and excludes the owner's unrelated working changes. Other work may be active in the original checkout; do not revert it. Keep code and tests scoped to F1/F2 and commit each meaningful step without attribution lines. The CPU check command above builds from this checkout as well; keep experimental probes outside the repository. Leave this PR as a draft while required platform/backend checks remain unperformed.
+An isolated local checkout for this PR is available at `/tmp/strata-refinery-stream-restore/repo`. It starts at the exact reviewed Strata head and excludes the owner's unrelated working changes. Other work may be active in the original checkout; do not revert it. Keep code and tests scoped to F1/F2 and commit each meaningful step without attribution lines. The CPU check command above builds from this checkout as well; keep experimental probes outside the repository. Readiness follows the Linux/CUDA deployment scope; keep other-platform checks explicitly unverified.
 
 ## Fix validation (2026-11-16)
 
@@ -105,4 +107,27 @@ Passed after these fixes:
 - Strict CPU-only build with the command above and execution: **234 checks passed** on Linux.
 - `git diff --check`.
 
-The backend, Windows and live-GPU checks listed above remain unperformed. Keep this PR as a draft.
+The initial CPU validation did not cover backend or live-GPU behavior. The Linux/CUDA validation below supersedes that gap for this deployment; Windows and other backends remain unverified.
+
+
+## Linux/CUDA validation for the deployment target (2026-11-16)
+
+Code revision tested: `e5bcaab9de6bac8ed3b0c66d16bbd7f8466a95f9`. This final report update changes documentation only.
+
+Passed:
+
+- Fresh full Linux CUDA engine build, CUDA 13.4.92 / GCC 16.2.1, architecture 86, with conversation tests enabled. Configure used `-DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DCMAKE_BUILD_TYPE=Release`. Built `strata`, all five CPU conversation/session targets, and `conversation_snapshot_test`, `conversation_validation_test`, and `conversation_transfer_test`, with two build jobs and `CCACHE_DISABLE=1`. Build completed with warnings and no errors. The resulting engine's help exposes both session flags.
+- An external GPU probe derived from `conversation_snapshot_test.cpp`: **1,728 checks passed across 16 full-session fixtures**, including F16, INT8, Q4 and K8V4, resident and pinned-host streaming modes, main and draft K/V, and 256/512-expert geometry. The probe reads through `session_file_read(stream_kv=true)`, verifies exact captured state after `conversation_snapshot_restore`, mutates the first V payload in place after validation, verifies `transfer_failed` after the complete first K has been written, repairs that byte, and successfully restores again. K8V4 with pinned host K/V is included. Probe source/binary remain outside the repository under `/tmp/strata-refinery-stream-restore/gpu_stream_hybrid_probe.*`.
+- The final corruption probe again refuses saving a truncated backing file without publication, and rereads the unchanged destination successfully.
+- Nine of ten selected conversation CTest entries pass, including the two asynchronous GPU snapshot variants, CPU file/cache/memory/split/reclaim tests, validation and transfer-failure tests.
+
+Failed / baseline comparison:
+
+- Default `conversation_snapshot_test` fails at `A/B/A byte-exact K/V and indexer state` under CTest on the fix revision. A direct run of the same copied binary passed all 4,195 checks.
+- Rebuilt that same test on pre-change parent `ef53559cec74cc4bddc78033f9fcc2ec94d2106e`. It passed once, then reproduced the identical assertion on the first iteration of `ctest -R '^conversation_snapshot_test$' --repeat until-fail:10 --output-on-failure`. Restored the fix branch and rebuilt the full engine/test targets; the final CTest run is again **9/10** with the same default-test assertion. The cause of this pre-existing intermittent failure is unresolved. It is not reported as a regression introduced by the reviewed commits, and it is not counted as a pass.
+
+Remaining limits:
+
+- No native Windows or other-backend validation is claimed.
+- The GPU probe uses small real CUDA fixtures rather than a loaded language model. Full live-server fatal-exit/restart behavior and the original 177,545-token cold-restore performance/RSS measurement were not rerun.
+- The built engine remains isolated in `/tmp`; the installed engine and running services were not replaced or restarted.
