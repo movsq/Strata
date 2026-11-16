@@ -219,6 +219,29 @@ int main() {
     }
 
     const std::vector<char> image = slurp(good);
+    // Reader failures before and after a partial visit must never publish a replacement.
+    for (bool partial : {false, true}) {
+        SavedConversation failing = original;
+        int reads = 0;
+        const size_t size = failing.kv[0].k.size();
+        failing.kv[0].k = ConversationBuffer::from_reader(size,
+            [&](size_t, size_t, const ConversationBuffer::Visitor& visit) {
+                ++reads;
+                const uint8_t byte = 0;
+                if (partial && !visit(&byte, 1, 0)) return false;
+                return false;
+            });
+        const fs::path destination = dir / "reader-failure.bin";
+        spit(destination, image);
+        SessionStatus status;
+        check(!session_file_write(destination.string(), failing, id, written, error, {}, &status),
+              "a failing buffer reader refuses saving");
+        check(reads == 1, "the sizing pass counts buffers without reading them");
+        check(!status.published && status.error == SessionError::io && error.find("K/V source read") != std::string::npos,
+              "buffer read failure reports an unpublished I/O error");
+        check(slurp(destination) == image && no_temp(dir), "buffer read failure preserves the existing file and cleans up");
+    }
+
     // truncation at every structural boundary and in the middle
     for (size_t cut : {size_t(0), size_t(7), size_t(63), size_t(64), size_t(65), size_t(200), image.size() / 2,
                        image.size() - 17, image.size() - 16, image.size() - 8, image.size() - 1}) {
@@ -780,6 +803,9 @@ int main() {
         size_t read = 0;
         check(session_file_read(good.string(), id, back, read, error, limits), "streaming read validates");
         check(read == image.size() && same(original, back), "streaming read matches every payload byte");
+        const fs::path rewritten = dir / "stream-rewritten.bin";
+        check(session_file_write(rewritten.string(), back, id, written, error) && slurp(rewritten) == image,
+              "saving an intact streamed image preserves the file format");
         check(back.kv[0].k.file_backed() && back.kv[0].k.bytes() < 1024,
               "streamed K/V has no payload allocation");
         check(largest <= 49u << 20, "streaming admission reserves bounded scratch, not the file");
@@ -814,6 +840,16 @@ int main() {
         spit(replaced, image);
         SavedConversation held;
         check(session_file_read(replaced.string(), id, held, read, error, limits), "open streamed replacement fixture");
+#ifdef _WIN32
+        std::error_code blocked;
+        fs::rename(replaced, dir / "stream-old.bin", blocked);
+        check(bool(blocked), "Windows refuses renaming a held streamed file");
+        std::ofstream writer(replaced, std::ios::binary | std::ios::trunc);
+        check(!writer, "Windows refuses writing a held streamed file");
+        fs::resize_file(replaced, 64, blocked);
+        check(bool(blocked), "Windows refuses truncating a held streamed file");
+        check(same(original, held), "refused mutations leave the streamed file readable");
+#else
         fs::rename(replaced, dir / "stream-old.bin");
         spit(replaced, std::vector<char>(image.size(), 'x'));
         check(same(original, held), "streamed buffers keep the original file handle after path replacement");
@@ -830,6 +866,14 @@ int main() {
         spit(changed, image);
         fs::resize_file(changed, 64);
         check(!held.kv[0].k.read(got.data(), 0, got.size()), "a file truncated after validation fails its read");
+        const fs::path destination = dir / "stream-save-destination.bin";
+        spit(destination, image);
+        SessionStatus status;
+        check(!session_file_write(destination.string(), held, id, written, error, {}, &status) &&
+              !status.published && status.error == SessionError::io,
+              "saving a truncated streamed image fails without publishing");
+        check(slurp(destination) == image && no_temp(dir), "failed streamed save preserves the destination and removes its temporary file");
+#endif
     }
 #if defined(__linux__) && !defined(__SANITIZE_ADDRESS__) && !defined(STRATA_NO_RLIMIT_TEST)
     // A 256 MiB K/V image restores under a 192 MiB address-space ceiling.
