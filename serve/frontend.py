@@ -612,8 +612,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
-            kwargs = {"enable_thinking": False}
-        elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
+            kwargs["enable_thinking"] = False
+        elif k == "reasoning_effort":
             kwargs.update(effort_kwargs(v))
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 

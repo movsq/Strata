@@ -7,6 +7,23 @@ from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messag
 from serve.server import ByteTokenizer, MockEngine, Service
 
 
+class ThinkingEffort(unittest.TestCase):
+    def test_thinking_off_preserves_explicit_effort(self):
+        for effort in ("low", "medium", "xhigh"):
+            for nested in ({"enable_thinking": False},
+                           {"enable_thinking": False, "reasoning_effort": effort},
+                           {"reasoning_effort": effort, "enable_thinking": False}):
+                with self.subTest(effort=effort, nested=nested):
+                    _, _, kwargs = openai_to_messages({
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "reasoning_effort": effort, "chat_template_kwargs": nested})
+                    self.assertEqual(kwargs, {"reasoning_effort": effort, "enable_thinking": False})
+                    template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
+                    prompt = template.render([{"role": "user", "content": "hello"}], **kwargs)
+                    self.assertTrue(prompt.endswith("<think>\n\n</think>\n\n"))
+                    self.assertNotIn("Reasoning effort is set to", prompt)
+
+
 class EmptyAssistantHistory(unittest.TestCase):
     def setUp(self):
         self.template = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
