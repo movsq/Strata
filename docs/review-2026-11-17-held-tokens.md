@@ -79,12 +79,46 @@ Rerunnable setup uses a context of 4096. First render user `hi` with thinking di
 
 Observed prepared cap is 2515 and automatic thinking budget is 1887. Held-ID reuse expands the prompt by 1500 tokens and reduces the cap to 1015. Generation ends at 1015 reasoning tokens, emits zero content events, and never reaches the reasoning-close continuation. Expected is budget/reserve calculation against the actual cap, preserving the existing answer-room behavior.
 
+### F6 — [P2] Invalidate IDs when the engine loses its held conversation
+
+Affected code is the newly introduced `_held` lifecycle in `_run`, together with `ensure_loaded` and `unload`.
+
+A real Service lifecycle probe generates sampled IDs `[97,98]` after prompt `[80]`, unloads the scripted engine using `service.unload()`, then sends encoded `PabX` through `run`, which calls `ensure_loaded()` to restart it. Observed submitted IDs remain `[80,97,98,88]` despite the newly loaded engine holding no conversation. The encoded prompt is `[80,262,88]`. Stale expansions can consume answer room with no reusable state.
+
+A second probe sets reasoning budget 2 and max_new 500. Its first native pass yields `a,b`, reaches the budget, and records `_held = (1, [80,97,98])`. Its next native pass raises `EngineNonFinite`, which means the native cache was cleared. Observed `_held` still contains the first pass's IDs. Both probes exercise the real Service with scripted native lifecycle/failure behavior and live outside the repository as `reset_probe.py` and `nonfinite_probe.py`.
+
+Expected is empty held metadata after state loss, including automatic restart and a failed continuation. The evidence was added to the same PR before fixing it.
+
 ## Checks on the reviewed head
 
 Passed through external probes are reuse spanning earlier replies, a shared partial start, a genuinely changed suffix, pin movement after a replaced span, context-safe max_new, and fallback when replacement leaves zero answer tokens. F1 through F5 were reproduced as described above. F1 was repeated with the production tokenizer and template.
 
-The first `serve.test_server` run encountered sandbox restrictions on loopback sockets and returned 118 errors plus one GPU-order assertion failure. An unrestricted loopback-enabled rerun is in progress. These failures are recorded separately from confirmed regressions.
+The first `serve.test_server` run encountered sandbox restrictions on loopback sockets and returned 118 errors plus one GPU-order assertion failure. The unrestricted loopback-enabled rerun executed 383 tests with the GPU-order assertion as its only failure. The same assertion was separately reproduced in the exact parent worktree at `e360625e`. These failures are recorded separately from confirmed regressions.
 
 ## Remaining verification gaps
 
 Live-model token reuse and cache-hit timing, native GPU session save/restore, Windows execution, other model families, and native engine restarts/unload have not been exercised. Batched requests are explicitly outside the user's acceptance scope. The existing slot tests could not be inspected because a personal-data hook rejected that file, citing its network calls and `/etc/passwd` fixture. This review uses isolated external slot probes instead. The hook did not reject the external probes.
+
+## Fixes and verification
+
+Code fixes are in `6a34d3a0` and `0daaee62`.
+
+- F1 checks marker IDs at their exact byte spans. Ordinary text can reuse held IDs across matching markers and later replies. The production-tokenizer probe now sends exactly the originally encoded IDs, with 2 start controls and 1 end control.
+- F2 performs native session I/O and metadata I/O under the same FIFO. Threaded save and restore checks show the next generation waiting until both complete. Restoring afterward recovers the saved IDs.
+- F3 revises the implementer naming choice to `.<filename>.held` in the same directory. Slot filenames already reject leading dots. Atomic writes use unique temporary names. Accepted names ending in `.held` or `.held.tmp` survive other sessions' saves and metadata removal.
+- F4 replaces the raw integer array with bounded JSON containing token IDs and the native session file's device/inode/size/mtime identity. Restore clears old held state first, verifies the identity, length, ID types and vocabulary, and skips unusable metadata. A failed metadata publication followed by restore rejects the stale sidecar. A missing sidecar restores with no held IDs.
+- F5 calculates thinking budgets and live status from the prompt and output cap actually sent. A request eligible for the existing answer-room reserve keeps that eligibility if reuse reduces its cap below the usual threshold. The reproduced 1015-token cap now closes thinking and emits answer content.
+- F6 invalidates held IDs during unload/restart and before each native continuation pass. Both external lifecycle/failure probes now retain no stale IDs. The reloaded engine receives `[80,262,88]`.
+- Reuse logging occurs only when the replacement is actually selected, including the zero-room fallback check.
+
+Compatibility choice is that legacy raw `PATH.held` metadata is left alone and ignored by the new reader. Existing native session files still restore. Their first restore uses ordinary encoding until new metadata is saved. This avoids interpreting another valid saved session as legacy token metadata.
+
+Validation completed so far follows.
+
+- `python -m unittest serve.test_held_tokens -q` passes all 17 focused regression tests.
+- `python -m unittest serve.test_frontend tools.test_strata_tokenizer tools.test_tokenizer_plain_spans -q` passes, 47 tests with 3 skips.
+- A post-fix server run plus the initial 15 regression tests executed 398 tests with the same parent-reproduced GPU-order assertion as the only failure.
+- The full combined suite is being rerun on the final code revision, including both added lifecycle tests.
+- The installed Qwen tokenizer/template probe passes after the fix. `git diff --check` passes.
+
+The running services and installed engine have not been replaced or restarted. Full live-model/cache timing, GPU disk-slot behavior, other model families and native Windows remain unverified. Python-only changes do not require rebuilding engine backends. A fresh read-only reviewer will inspect the published fixes as requested by the user.
