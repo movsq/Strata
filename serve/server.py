@@ -5855,6 +5855,10 @@ class Service:
             if stream[i] in marker_ids:
                 markers.append((start, len(held_bytes), stream[i]))
             ends[len(held_bytes)] = i + 1
+        prefix = (sampling or {}).get("strata_prefix")
+        pin = prefix.get("tokens") if isinstance(prefix, dict) else None
+        pin = pin if type(pin) is int else None
+        kept_pin = None
         p = q = None
         got, marker = 0, 0
         for j in range(at, len(ids)):
@@ -5868,17 +5872,22 @@ class Service:
             if protected is not None:
                 marker += 1
             got = end
+            if j + 1 == pin and got not in ends:
+                break                                   # keep the pin's exact byte boundary in the encoded suffix
             if got in ends:
                 p, q = ends[got], j + 1
+                if q == pin:
+                    kept_pin = p
             if got >= len(held_bytes):
                 break
         if p is None:
             return ids, sampling
         kept = stream[:p] + ids[q:]
         grown = len(kept) - len(ids)
-        prefix = (sampling or {}).get("strata_prefix")
-        if grown and isinstance(prefix, dict) and isinstance(prefix.get("tokens"), int) and prefix["tokens"] >= q:
-            sampling = {**sampling, "strata_prefix": {**prefix, "tokens": prefix["tokens"] + grown}}
+        if pin is not None:
+            new_pin = pin + grown if pin >= q else kept_pin
+            if new_pin is not None and new_pin != pin:
+                sampling = {**sampling, "strata_prefix": {**prefix, "tokens": new_pin}}
         return kept, sampling
 
     def render_prompt(self, messages, tools, kwargs) -> str:

@@ -75,6 +75,31 @@ class HeldTokens(unittest.TestCase):
         self.assertEqual(actual["strata_prefix"], {"tokens": len(sent) - 1})
         self.assertEqual(sampling["strata_prefix"], {"tokens": len(ids) - 1})
 
+    def test_internal_pins_follow_their_shared_byte_boundary(self):
+        cases = [
+            (list(b"PabXabY"), [80, 262, 88, 262, 89, 90], 3, 4),
+            ([80, 97, 98, 88, 262, 89], [80, 262, 88, 97, 98, 89, 90], 3, 4),
+            ([80, 262, 88, 97, 98, 89], [80, 97, 98, 88, 262, 89, 90], 4, 3),
+        ]
+        for held, ids, pin, expected in cases:
+            with self.subTest(held=held):
+                self.service._held = (0, held)
+                sampling = {"strata_prefix": {"tokens": pin}}
+                self.run_prompt(ids, sampling=sampling)
+                sent, _, actual = self.engine.calls[-1]
+                self.assertEqual(actual["strata_prefix"]["tokens"], expected)
+                self.assertEqual(self.tokenizer.decode(sent[:expected]), self.tokenizer.decode(ids[:pin]))
+                self.assertEqual(sampling["strata_prefix"]["tokens"], pin)
+
+    def test_reuse_stops_before_a_pin_inside_a_held_token(self):
+        self.service._held = (0, [80, 97, 98, 263, 89])  # P + a + b + bc + Y
+        ids = [80, 262, 98, 99, 89, 90]                 # P + ab + b + c + Y + Z
+        self.run_prompt(ids, sampling={"strata_prefix": {"tokens": 3}})
+        sent, _, actual = self.engine.calls[-1]
+        self.assertEqual(sent, [80, 97, 98, 98, 99, 89, 90])
+        self.assertEqual(actual["strata_prefix"]["tokens"], 4)
+        self.assertEqual(self.tokenizer.decode(sent[:4]), self.tokenizer.decode(ids[:3]))
+
     def test_partial_shared_start(self):
         self.service._held = (1, list(b"PabXabY"))
         self.run_prompt(self.tokenizer.encode("PabXZ"))
