@@ -35,6 +35,7 @@ import hmac
 import codecs
 import json
 import math
+import array
 import os
 import queue
 import re
@@ -5063,11 +5064,34 @@ class Service:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
                     self.status["queued"] -= 1
+        self._held_file(action, path)
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
         return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
+
+    def _held_file(self, action: str, path: str) -> None:
+        """dotware: a session's held ids beside its file (PATH.held), so _keep_held_reply works on a restored chat too."""
+        side = path + ".held"
+        try:
+            if action == "save":
+                held = getattr(self, "_held", None)
+                if held is None:
+                    os.unlink(side)
+                else:
+                    tmp = side + ".tmp"
+                    with open(tmp, "wb") as f:
+                        array.array("i", held[1]).tofile(f)
+                    os.replace(tmp, side)
+            else:
+                ids = array.array("i")
+                with open(side, "rb") as f:
+                    ids.frombytes(f.read())
+                self._held = (0, ids.tolist())
+        except OSError:
+            if action == "restore":
+                self._held = None
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -5786,33 +5810,42 @@ class Service:
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
     def _keep_held_reply(self, ids, sampling):
-        """dotware: the engine continues a prompt only if it starts with every token the engine holds - the last
-        request's prompt and the reply it generated.  A sampled reply can split a word as the tokenizer never would
-        ("t" + "ě" where it encodes "tě" as one token), so the next prompt, which comes back as text, encodes that
-        reply to other ids and the engine reads the whole reply again from its turn checkpoint.  When the prompt
-        spells the held tokens byte for byte, their ids are taken as held.  Not only the last reply: the reply before
-        it comes back as text again in every later prompt, and the held tokens are its kept ids."""
+        """dotware: the engine continues a prompt only as far as it matches the tokens the engine holds.  A sampled
+        reply can split a word as the tokenizer never would ("t" + "ě" where it encodes "tě" as one token), and every
+        later prompt, which comes back as text, encodes that reply to other ids: the engine reads everything after it
+        again.  Where the prompt spells the held tokens byte for byte, their ids are taken as held, up to the last
+        token boundary the two share (a memory review's own message, say, is held but not in the next prompt)."""
         held = getattr(self, "_held", None)
         if held is None or not hasattr(self.tok, "token_bytes"):
             return ids, sampling
-        _, stream = held                        # every token the engine holds, earlier replies kept here included
+        _, stream = held
         at = next((i for i, (a, b) in enumerate(zip(stream, ids)) if a != b), None)
         if at is None:
             return ids, sampling
-        want = b"".join(self.tok.token_bytes(t) for t in stream[at:])
-        got, end = b"", at
-        while len(got) < len(want) and end < len(ids):
-            got += self.tok.token_bytes(ids[end])
-            end += 1
-        if got != want:
+        ends, held_bytes = {}, bytearray()              # byte offset of each held token's end -> its index
+        for i in range(at, len(stream)):
+            held_bytes += self.tok.token_bytes(stream[i])
+            ends[len(held_bytes)] = i + 1
+        p = q = None
+        got = 0
+        for j in range(at, len(ids)):
+            piece = self.tok.token_bytes(ids[j])
+            if held_bytes[got:got + len(piece)] != piece:
+                break
+            got += len(piece)
+            if got in ends:
+                p, q = ends[got], j + 1
+            if got >= len(held_bytes):
+                break
+        if p is None:
             return ids, sampling
-        kept = stream + ids[end:]
+        kept = stream[:p] + ids[q:]
         grown = len(kept) - len(ids)
         prefix = (sampling or {}).get("strata_prefix")
-        if grown and isinstance(prefix, dict) and isinstance(prefix.get("tokens"), int) and prefix["tokens"] > at:
+        if grown and isinstance(prefix, dict) and isinstance(prefix.get("tokens"), int) and prefix["tokens"] >= q:
             sampling = {**sampling, "strata_prefix": {**prefix, "tokens": prefix["tokens"] + grown}}
         print(f"[strata] dotware: the prompt spells the held tokens with others from its token {at}; "
-              f"kept the {len(stream) - at} held tokens as generated", flush=True)
+              f"kept {p - at} held tokens as generated", flush=True)
         return kept, sampling
 
     def render_prompt(self, messages, tools, kwargs) -> str:
