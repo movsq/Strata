@@ -5329,6 +5329,8 @@ class Service:
         the free-VRAM check.  The caller holds self.fifo."""
         if self.loaded() and not self._vision_down():
             return
+        if not self.loaded():
+            self._held = None
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -5539,6 +5541,7 @@ class Service:
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
             self.engine.unload()
+            self._held = None
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
@@ -6493,6 +6496,8 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        if not par:
+                            self._held = None       # a failed continuation must not retain the previous pass
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None

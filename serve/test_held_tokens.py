@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, CTX_SLACK, MockEngine, Service
+from serve.server import ByteTokenizer, CTX_SLACK, EngineNonFinite, MockEngine, Service
 
 
 class Tokenizer(ByteTokenizer):
@@ -225,6 +225,40 @@ class HeldTokens(unittest.TestCase):
                 self.assertEqual(self.service._held[1], [66])
                 self.restore()
                 self.assertEqual(self.service._held[1], [65])
+
+    def test_unload_and_automatic_restart_clear_held_ids(self):
+        for unload in (True, False):
+            with self.subTest(unload=unload):
+                self.engine.up = True
+                self.engine.alive = lambda: self.engine.up
+                self.engine.unload = lambda: setattr(self.engine, "up", False)
+                self.engine.restart = lambda: setattr(self.engine, "up", True)
+                self.engine.script = [97, 98, 257]
+                self.engine.scripts = [self.engine.script]
+                self.run_prompt([80])
+                if unload:
+                    self.assertEqual(self.service.unload(), "unloaded")
+                else:
+                    self.engine.up = False
+                self.engine.script = [257]
+                self.engine.scripts = [self.engine.script]
+                self.run_prompt([80, 262, 88])
+                self.assertEqual(self.engine.last_prompt, [80, 262, 88])
+
+    def test_failed_continuation_drops_the_previous_pass_metadata(self):
+        original = self.engine.generate
+        calls = []
+        def generate(*args, **kwargs):
+            calls.append(None)
+            if len(calls) == 2:
+                raise EngineNonFinite("cache cleared")
+            yield from original(*args, **kwargs)
+        self.engine.script = list(b"ab" * 100) + [257]
+        self.engine.scripts = [self.engine.script]
+        with mock.patch.object(self.engine, "generate", generate):
+            self.run_prompt([80], thinking=True, max_new=500, sampling={"reasoning_budget_tokens": 2})
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(self.service._held)
 
     def test_thinking_reserve_follows_actual_output_cap(self):
         self.engine.script = list(b"ab" * 1500) + [257]
