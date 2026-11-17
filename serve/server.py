@@ -5790,13 +5790,14 @@ class Service:
         request's prompt and the reply it generated.  A sampled reply can split a word as the tokenizer never would
         ("t" + "ě" where it encodes "tě" as one token), so the next prompt, which comes back as text, encodes that
         reply to other ids and the engine reads the whole reply again from its turn checkpoint.  When the prompt
-        spells the held reply byte for byte, the reply's ids are taken as held."""
+        spells the held tokens byte for byte, their ids are taken as held.  Not only the last reply: the reply before
+        it comes back as text again in every later prompt, and the held tokens are its kept ids."""
         held = getattr(self, "_held", None)
         if held is None or not hasattr(self.tok, "token_bytes"):
             return ids, sampling
-        start, stream = held                    # where the last request's reply starts, and the held tokens
+        _, stream = held                        # every token the engine holds, earlier replies kept here included
         at = next((i for i, (a, b) in enumerate(zip(stream, ids)) if a != b), None)
-        if at is None or at < start:
+        if at is None:
             return ids, sampling
         want = b"".join(self.tok.token_bytes(t) for t in stream[at:])
         got, end = b"", at
@@ -5810,8 +5811,8 @@ class Service:
         prefix = (sampling or {}).get("strata_prefix")
         if grown and isinstance(prefix, dict) and isinstance(prefix.get("tokens"), int) and prefix["tokens"] > at:
             sampling = {**sampling, "strata_prefix": {**prefix, "tokens": prefix["tokens"] + grown}}
-        print(f"[strata] dotware: the prompt spells the held reply with other tokens from its token {at - start}; "
-              f"kept the reply's {len(stream) - at} tokens as generated", flush=True)
+        print(f"[strata] dotware: the prompt spells the held tokens with others from its token {at}; "
+              f"kept the {len(stream) - at} held tokens as generated", flush=True)
         return kept, sampling
 
     def render_prompt(self, messages, tools, kwargs) -> str:
@@ -6413,7 +6414,10 @@ class Service:
                         rate.clear()                    # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
                     if not par:
-                        ids, sampling = self._keep_held_reply(ids, sampling)
+                        kept, kept_sampling = self._keep_held_reply(ids, sampling)
+                        room = self.engine.max_context - CTX_SLACK - len(kept)   # max_new was sized for `ids`
+                        if room >= 1:
+                            ids, sampling, max_new = kept, kept_sampling, min(max_new, room)
                         self._held = None           # until this request's last pass says what the engine holds
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
