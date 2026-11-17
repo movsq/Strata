@@ -89,6 +89,14 @@ A second probe sets reasoning budget 2 and max_new 500. Its first native pass yi
 
 Expected is empty held metadata after state loss, including automatic restart and a failed continuation. The evidence was added to the same PR before fixing it.
 
+### F7 — [P2] Remap prefix pins within a reused span
+
+The requested fresh GPT-6.1 Sol reviewer at medium effort found this gap on `c54d88e7`. Independent reproduction through `Service.run` confirms it. Held `PabXabY` as byte IDs and newly encoded `PabXabYZ` with `strata_prefix.tokens=3` produce expanded submitted IDs whose unchanged pin marks `Pab`. The requested prefix is `PabX`, which requires pin 4.
+
+The existing guard only shifts pins following the complete replaced span. Reuse spans multiple replies, so a pin between retokenized replies can require a local shift even when total token growth is zero. This finding preserves the stated pin intent across individual replaced spans.
+
+The fix records the held boundary corresponding to an internal encoded pin. If the pin falls inside a held token, reuse ends at the preceding mutual boundary and retains the encoded suffix so the exact pin can be represented. Tests cover growth, shrinkage, zero total growth with local changes, and an unaligned internal pin. The external `internal_pin_probe.py` now reports `PabX` on both sides with submitted pin 4.
+
 ## Checks on the reviewed head
 
 Passed through external probes are reuse spanning earlier replies, a shared partial start, a genuinely changed suffix, pin movement after a replaced span, context-safe max_new, and fallback when replacement leaves zero answer tokens. F1 through F5 were reproduced as described above. F1 was repeated with the production tokenizer and template.
@@ -101,7 +109,7 @@ Live-model token reuse and cache-hit timing, native GPU session save/restore, Wi
 
 ## Fixes and verification
 
-Code fixes are in `6a34d3a0` and `0daaee62`.
+Code fixes are in `6a34d3a0`, `0daaee62`, and `a9b67bbf`.
 
 - F1 checks marker IDs at their exact byte spans. Ordinary text can reuse held IDs across matching markers and later replies. The production-tokenizer probe now sends exactly the originally encoded IDs, with 2 start controls and 1 end control.
 - F2 performs native session I/O and metadata I/O under the same FIFO. Threaded save and restore checks show the next generation waiting until both complete. Restoring afterward recovers the saved IDs.
@@ -109,16 +117,18 @@ Code fixes are in `6a34d3a0` and `0daaee62`.
 - F4 replaces the raw integer array with bounded JSON containing token IDs and the native session file's device/inode/size/mtime identity. Restore clears old held state first, verifies the identity, length, ID types and vocabulary, and skips unusable metadata. A failed metadata publication followed by restore rejects the stale sidecar. A missing sidecar restores with no held IDs.
 - F5 calculates thinking budgets and live status from the prompt and output cap actually sent. A request eligible for the existing answer-room reserve keeps that eligibility if reuse reduces its cap below the usual threshold. The reproduced 1015-token cap now closes thinking and emits answer content.
 - F6 invalidates held IDs during unload/restart and before each native continuation pass. Both external lifecycle/failure probes now retain no stale IDs. The reloaded engine receives `[80,262,88]`.
+- F7 remaps internal prefix pins at their shared byte boundary and preserves unaligned pins in the encoded suffix.
 - Reuse logging occurs only when the replacement is actually selected, including the zero-room fallback check.
 
 Compatibility choice is that legacy raw `PATH.held` metadata is left alone and ignored by the new reader. Existing native session files still restore. Their first restore uses ordinary encoding until new metadata is saved. This avoids interpreting another valid saved session as legacy token metadata.
 
 Validation completed so far follows.
 
-- `python -m unittest serve.test_held_tokens -q` passes all 17 focused regression tests.
+- `python -m unittest serve.test_held_tokens -q` passes all 19 focused regression tests.
 - `python -m unittest serve.test_frontend tools.test_strata_tokenizer tools.test_tokenizer_plain_spans -q` passes, 47 tests with 3 skips.
 - A post-fix server run plus the initial 15 regression tests executed 398 tests with the same parent-reproduced GPU-order assertion as the only failure.
-- The full combined suite is being rerun on the final code revision, including both added lifecycle tests.
+- The full combined suite on `0daaee62` executed 447 tests, with 3 skips and the parent-reproduced GPU-order assertion as its only failure. A rerun on `a9b67bbf` is in progress.
 - The installed Qwen tokenizer/template probe passes after the fix. `git diff --check` passes.
+- External deterministic randomized checking covers 20,610 token-stream/pin cases. Byte identity, protected marker spans, and pinned prefix bytes all match before and after reuse. The probe is `/tmp/strata-refinery-held/boundary_fuzz.py`, seeded with 71117.
 
-The running services and installed engine have not been replaced or restarted. Full live-model/cache timing, GPU disk-slot behavior, other model families and native Windows remain unverified. Python-only changes do not require rebuilding engine backends. A fresh read-only reviewer will inspect the published fixes as requested by the user.
+Validation uses isolated scripted engines and the installed production tokenizer. Full live-model/cache timing, GPU disk-slot behavior, other model families and native Windows remain unverified. The requested fresh read-only reviewer received the PR URL and read-only instructions, plus the worktree location when requested. It found F7 and made no edits. The reviewing agent independently reproduced and fixed F7.
