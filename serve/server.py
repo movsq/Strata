@@ -35,7 +35,6 @@ import hmac
 import codecs
 import json
 import math
-import array
 import os
 import queue
 import re
@@ -5048,6 +5047,7 @@ class Service:
                         r = session_file(self, action, path, SessionRefused)
                     else:
                         r = self.engine.session_file(action, path)
+                    self._held_file(action, path)
                 except SessionRefused as e:
                     body = error(e.status, str(e))
                     body[1]["error"]["kind"] = e.kind
@@ -5064,7 +5064,6 @@ class Service:
             if waiting:                                     # never reached the FIFO (an exception while waiting)
                 with self.status_lock:
                     self.status["queued"] -= 1
-        self._held_file(action, path)
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
@@ -5072,26 +5071,44 @@ class Service:
                      "timings": {"restore_ms": r["ms"]}}
 
     def _held_file(self, action: str, path: str) -> None:
-        """dotware: a session's held ids beside its file (PATH.held), so _keep_held_reply works on a restored chat too."""
-        side = path + ".held"
+        """Held IDs are optional session metadata. Leading-dot names cannot collide with accepted slot filenames."""
+        side = os.path.join(os.path.dirname(path), "." + os.path.basename(path) + ".held")
+        tmp = None
+        if action == "restore":
+            self._held = None
         try:
+            st = os.stat(path, follow_symlinks=False)
+            identity = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
             if action == "save":
                 held = getattr(self, "_held", None)
                 if held is None:
                     os.unlink(side)
-                else:
-                    tmp = side + ".tmp"
-                    with open(tmp, "wb") as f:
-                        array.array("i", held[1]).tofile(f)
-                    os.replace(tmp, side)
+                    return
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                                 prefix=".held-", delete=False) as f:
+                    tmp = f.name
+                    json.dump({"session": identity, "ids": held[1]}, f)
+                os.replace(tmp, side)
             else:
-                ids = array.array("i")
                 with open(side, "rb") as f:
-                    ids.frombytes(f.read())
-                self._held = (0, ids.tolist())
-        except OSError:
-            if action == "restore":
-                self._held = None
+                    data = json.loads(f.read(self.engine.max_context * 12 + 1024))
+                ids = data["ids"]
+                if (data["session"] != identity or not isinstance(ids, list) or
+                        len(ids) > self.engine.max_context or any(type(t) is not int or t < 0 for t in ids)):
+                    return
+                for t in ids:
+                    self.tok.token_bytes(t)          # validate the vocabulary before these IDs can affect a request
+                self._held = (0, ids)
+        except FileNotFoundError:
+            pass                                    # sessions without optional metadata still restore normally
+        except (OSError, ValueError, LookupError, TypeError, AttributeError) as e:
+            print(f"[strata] held-token metadata {action} skipped: {e}", flush=True)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -5822,17 +5839,32 @@ class Service:
         at = next((i for i, (a, b) in enumerate(zip(stream, ids)) if a != b), None)
         if at is None:
             return ids, sampling
-        ends, held_bytes = {}, bytearray()              # byte offset of each held token's end -> its index
+        marker_ids = set(getattr(self.tok, "special_tokens", {}).values())
+        if not marker_ids:
+            for literal in self.literals:
+                encoded = self.tok.encode(literal, parse_special=True)
+                if len(encoded) == 1:
+                    marker_ids.add(encoded[0])
+        ends, held_bytes, markers = {}, bytearray(), []  # shared byte boundaries and protected marker spans
         for i in range(at, len(stream)):
+            start = len(held_bytes)
             held_bytes += self.tok.token_bytes(stream[i])
+            if stream[i] in marker_ids:
+                markers.append((start, len(held_bytes), stream[i]))
             ends[len(held_bytes)] = i + 1
         p = q = None
-        got = 0
+        got, marker = 0, 0
         for j in range(at, len(ids)):
             piece = self.tok.token_bytes(ids[j])
             if held_bytes[got:got + len(piece)] != piece:
                 break
-            got += len(piece)
+            end = got + len(piece)
+            protected = markers[marker] if marker < len(markers) and markers[marker][0] < end else None
+            if (protected is not None or ids[j] in marker_ids) and protected != (got, end, ids[j]):
+                break                                   # literal bytes must never acquire a control/marker ID
+            if protected is not None:
+                marker += 1
+            got = end
             if got in ends:
                 p, q = ends[got], j + 1
             if got >= len(held_bytes):
@@ -5844,8 +5876,6 @@ class Service:
         prefix = (sampling or {}).get("strata_prefix")
         if grown and isinstance(prefix, dict) and isinstance(prefix.get("tokens"), int) and prefix["tokens"] >= q:
             sampling = {**sampling, "strata_prefix": {**prefix, "tokens": prefix["tokens"] + grown}}
-        print(f"[strata] dotware: the prompt spells the held tokens with others from its token {at}; "
-              f"kept {p - at} held tokens as generated", flush=True)
         return kept, sampling
 
     def render_prompt(self, messages, tools, kwargs) -> str:
@@ -6269,40 +6299,6 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
-        budget = self.reasoning_budget(sampling) if thinking else None
-        # dotware: llama.cpp's soft stage (reasoning_budget_soft_tokens + _soft_message, written into the reasoning once,
-        # which goes on) and its reasoning_budget_message (written before </think> in place of the wrap-up sentence)
-        soft = (sampling or {}).get("reasoning_budget_soft_tokens") if budget else None
-        soft_text = (sampling or {}).get("reasoning_budget_soft_message")
-        if not (isinstance(soft, int) and not isinstance(soft, bool) and 0 < soft < budget and soft_text):
-            soft = None
-        close_text = (sampling or {}).get("reasoning_budget_message")
-        if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
-            # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
-            # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
-            # the cut-off in the middle of the thinking and NO answer.  So thinking is closed early enough to leave
-            # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
-            # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
-            budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
-            if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
-                  "(\"answer_room\": false in the config turns this off)", flush=True)
-        if (thinking and not budget and self.answer_room and self.family == "deepseek41"
-                and max_new and DS41_SMALL_CAP_MIN <= max_new < ANSWER_ROOM_MIN_CAP):
-            # DeepSeek-V4.1 only: a short max_tokens (/v1/messages and /v1/chat/completions with 200-600) was spent
-            # entirely on the thinking, so no text block ever arrived.  With no budget of the client's own, the thinking
-            # is capped at half of max_tokens; then the wrap-up, </think> and the answer follow in the other half.
-            budget = max_new // 2
-            print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
-                  "(\"answer_room\": false in the config turns this off)", flush=True)
-        if budget and max_new and max_new > 0:
-            # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
-            # it has no answer.  Close the thinking early enough to leave room for one.
-            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
-            if budget > max_new - reserve:
-                print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
-                      f"the answer (budget {budget})", flush=True)
-                budget = max(1, max_new - reserve)
         parser = self.parser_cls(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
                                  recover=self.tool_call_recovery, declared_only=declared_only,
                                  deferred=deferred or self.undeclared_tool_calls == "call")   # #4622: opt-in, as for a deferred tool
@@ -6431,6 +6427,50 @@ class Service:
                     elif not (self.loaded() and not self._vision_down()):
                         with self._inference_fifo(deadline, cancel):
                             self.ensure_loaded()
+                    budget_cap = max_new             # retain answer-room eligibility when held IDs reduce the cap
+                    if not par:
+                        kept, kept_sampling = self._keep_held_reply(ids, sampling)
+                        room = self.engine.max_context - CTX_SLACK - len(kept)   # max_new was sized for `ids`
+                        if room >= 1:
+                            if kept is not ids:
+                                print(f"[strata] kept held token IDs in the prompt ({len(ids)} -> {len(kept)} tokens)",
+                                      flush=True)
+                            ids, sampling, max_new = kept, kept_sampling, min(max_new, room)
+                        self._held = None           # until this request's last pass says what the engine holds
+                    # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
+                    budget = self.reasoning_budget(sampling) if thinking else None
+                    # dotware: llama.cpp's soft stage (reasoning_budget_soft_tokens + _soft_message, written into the reasoning once,
+                    # which goes on) and its reasoning_budget_message (written before </think> in place of the wrap-up sentence)
+                    soft = (sampling or {}).get("reasoning_budget_soft_tokens") if budget else None
+                    soft_text = (sampling or {}).get("reasoning_budget_soft_message")
+                    if not (isinstance(soft, int) and not isinstance(soft, bool) and 0 < soft < budget and soft_text):
+                        soft = None
+                    close_text = (sampling or {}).get("reasoning_budget_message")
+                    if thinking and not budget and self.answer_room and max_new and budget_cap >= ANSWER_ROOM_MIN_CAP:
+                        # 0.1.45: max_tokens counts the thinking too.  A client that caps the reply at 8192 (the desktop agent's
+                        # harness sends max_completion_tokens: 8192 on every request) and a task the model thinks long about got
+                        # the cut-off in the middle of the thinking and NO answer.  So thinking is closed early enough to leave
+                        # the answer its quarter of the cap (the budget's wrap-up: a short closing sentence, </think>, the answer).
+                        # A request with a budget of its own, or max_tokens below ANSWER_ROOM_MIN_CAP, is left as it was.
+                        budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+                        if max_new <= 32768: print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
+                              "(\"answer_room\": false in the config turns this off)", flush=True)
+                    if (thinking and not budget and self.answer_room and self.family == "deepseek41"
+                            and max_new and DS41_SMALL_CAP_MIN <= budget_cap < ANSWER_ROOM_MIN_CAP):
+                        # DeepSeek-V4.1 only: a short max_tokens (/v1/messages and /v1/chat/completions with 200-600) was spent
+                        # entirely on the thinking, so no text block ever arrived.  With no budget of the client's own, the thinking
+                        # is capped at half of max_tokens; then the wrap-up, </think> and the answer follow in the other half.
+                        budget = max_new // 2
+                        print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
+                              "(\"answer_room\": false in the config turns this off)", flush=True)
+                    if budget and max_new and max_new > 0:
+                        # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
+                        # it has no answer.  Close the thinking early enough to leave room for one.
+                        reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+                        if budget > max_new - reserve:
+                            print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                                  f"the answer (budget {budget})", flush=True)
+                            budget = max(1, max_new - reserve)
                     with self.status_lock:
                         if par:
                             self.status["queued"] -= 1
@@ -6446,12 +6486,6 @@ class Service:
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
-                    if not par:
-                        kept, kept_sampling = self._keep_held_reply(ids, sampling)
-                        room = self.engine.max_context - CTX_SLACK - len(kept)   # max_new was sized for `ids`
-                        if room >= 1:
-                            ids, sampling, max_new = kept, kept_sampling, min(max_new, room)
-                        self._held = None           # until this request's last pass says what the engine holds
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     for ev in opening:
