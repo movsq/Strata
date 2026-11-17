@@ -5785,6 +5785,35 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def _keep_held_reply(self, ids, sampling):
+        """dotware: the engine continues a prompt only if it starts with every token the engine holds - the last
+        request's prompt and the reply it generated.  A sampled reply can split a word as the tokenizer never would
+        ("t" + "ě" where it encodes "tě" as one token), so the next prompt, which comes back as text, encodes that
+        reply to other ids and the engine reads the whole reply again from its turn checkpoint.  When the prompt
+        spells the held reply byte for byte, the reply's ids are taken as held."""
+        held = getattr(self, "_held", None)
+        if held is None or not hasattr(self.tok, "token_bytes"):
+            return ids, sampling
+        start, stream = held                    # where the last request's reply starts, and the held tokens
+        at = next((i for i, (a, b) in enumerate(zip(stream, ids)) if a != b), None)
+        if at is None or at < start:
+            return ids, sampling
+        want = b"".join(self.tok.token_bytes(t) for t in stream[at:])
+        got, end = b"", at
+        while len(got) < len(want) and end < len(ids):
+            got += self.tok.token_bytes(ids[end])
+            end += 1
+        if got != want:
+            return ids, sampling
+        kept = stream + ids[end:]
+        grown = len(kept) - len(ids)
+        prefix = (sampling or {}).get("strata_prefix")
+        if grown and isinstance(prefix, dict) and isinstance(prefix.get("tokens"), int) and prefix["tokens"] > at:
+            sampling = {**sampling, "strata_prefix": {**prefix, "tokens": prefix["tokens"] + grown}}
+        print(f"[strata] dotware: the prompt spells the held reply with other tokens from its token {at - start}; "
+              f"kept the reply's {len(stream) - at} tokens as generated", flush=True)
+        return kept, sampling
+
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
@@ -6383,6 +6412,9 @@ class Service:
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
+                    if not par:
+                        ids, sampling = self._keep_held_reply(ids, sampling)
+                        self._held = None           # until this request's last pass says what the engine holds
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     for ev in opening:
@@ -6512,6 +6544,8 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if not par and not nonfinite and finish != "error" and not cancel.is_set():
+                            self._held = (len(ids), list(prompt) + seg)
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
